@@ -68,11 +68,16 @@ LAYOUT_MAP = {
     "Promotor asignado al contrato":                 ("Contrato",            "CONTRATO_PROMOTOR"),
     "Hora de la captura\n-registro-":                ("Hora Registro",       None),
     "Folio Orden":                                   ("Folio Orden",         None),
-    "Comentarios":                                   (None,                  ""),
+    "Comentarios":                                   ("__Comentario__",      None),
 }
 
 # Columnas que usa la bitácora (nombres canónicos del archivo fuente)
-SOURCE_COLS = sorted({src for src, _ in LAYOUT_MAP.values() if src})
+SOURCE_COLS = sorted({src for src, _ in LAYOUT_MAP.values() if src and not src.startswith("__")}
+                     | {"Precio Ord."})
+
+SENTIDOS = ["Compra", "Venta"]
+# Tipos de orden a mercado: no tienen precio límite, no se puede deducir el sentido
+TIPOS_MERCADO = {"MDO", "MDO SIC"}
 
 HEADER_ROW = 2
 DATA_START  = 3
@@ -98,7 +103,7 @@ def parse_date(x):
     if x is None or (not isinstance(x, (date, time)) and pd.isna(x)): return None
     if isinstance(x, datetime): return x.date()
     if isinstance(x, date): return x
-    dt = pd.to_datetime(x, errors="coerce")
+    dt = pd.to_datetime(x, errors="coerce", dayfirst=True)   # formato México: dd/mm/aaaa
     return None if pd.isna(dt) else dt.date()
 
 def parse_time(x):
@@ -138,6 +143,33 @@ def get_promotor(row):
     except (ValueError, TypeError):
         contrato = None
     return CONTRATO_PROMOTOR.get(contrato, "SIN ASIGNAR")
+
+def norm_sentido(x):
+    """'C', 'CPA', 'COMPRA' -> 'Compra'; 'V', 'VTA', 'VENTA' -> 'Venta'; otro -> None."""
+    if x is None or (not isinstance(x, str) and pd.isna(x)): return None
+    t = norm_header(x).upper()
+    if t in ("C", "CPA", "COMPRA", "COMPRAS", "BUY", "B"): return "Compra"
+    if t in ("V", "VTA", "VENTA", "VENTAS", "SELL", "S"): return "Venta"
+    return None
+
+def deducir_sentido(row):
+    """Deduce el sentido SOLO cuando es matemáticamente seguro: en una orden con precio
+    límite, una compra nunca se ejecuta arriba de su límite y una venta nunca abajo.
+    Si se ejecutó a un precio estrictamente mejor que el límite, el sentido es inequívoco.
+    Devuelve (sentido, comentario) o (None, None) si no se puede saber."""
+    tipo = str(row.get("Tipo Orden") or "").strip().upper()
+    lim, asig = to_number(row.get("Precio Ord.")), to_number(row.get("Precio asignado"))
+    if tipo in TIPOS_MERCADO or not lim or not asig:
+        return None, None
+    if asig < lim - 1e-6:
+        return "Compra", f"Sentido deducido: precio asignado {asig} por debajo del límite {lim}"
+    if asig > lim + 1e-6:
+        return "Venta", f"Sentido deducido: precio asignado {asig} por encima del límite {lim}"
+    return None, None
+
+def folio_key(x):
+    n = to_number(x)
+    return str(n) if n is not None else str(x).strip()
 
 def etiqueta_mes(periodo: pd.Period) -> str:
     return f"{MESES[periodo.month - 1]} {periodo.year}"
@@ -179,6 +211,7 @@ def parse_broken_row(vals):
         "Emisora":             vals[4],
         "Serie":               vals[5],
         "Tipo Orden":          vals[6],
+        "Precio Ord.":         vals[7],
         "Precio asignado":     to_number("".join(str(v) for v in vals[8:f1 - 2])),
         "Operador":            clean_fragment(vals[f1 - 2]),
         "Fecha Registro":      vals[f1],
@@ -190,19 +223,39 @@ def parse_broken_row(vals):
         "Operación":           None,   # este export no trae el sentido (Compra/Venta)
     }
 
+def read_table(file):
+    """Lee .xlsx o .csv/.txt y devuelve (encabezado, renglones)."""
+    name = getattr(file, "name", "").lower()
+    if name.endswith((".csv", ".txt")):
+        raw = file.read()
+        text = None
+        for enc in ("utf-8-sig", "latin-1"):
+            try:
+                text = raw.decode(enc)
+                break
+            except UnicodeDecodeError:
+                continue
+        df = pd.read_csv(io.StringIO(text), sep=None, engine="python", dtype=str,
+                         keep_default_na=False)
+        rows = [list(df.columns)] + df.values.tolist()
+    else:
+        ws = openpyxl.load_workbook(file, data_only=True, read_only=True).worksheets[0]
+        rows = [list(r) for r in ws.iter_rows(values_only=True)]
+    header = rows[0]
+    body = [r for r in rows[1:] if any(v not in (None, "") for v in r)]
+    return header, body
+
 def load_source(file):
     """Devuelve (DataFrame con columnas canónicas, lista de avisos)."""
-    ws = openpyxl.load_workbook(file, data_only=True, read_only=True).worksheets[0]
-    rows = [list(r) for r in ws.iter_rows(values_only=True)]
-    header, body = rows[0], [r for r in rows[1:] if any(v not in (None, "") for v in r)]
+    header, body = read_table(file)
     avisos = []
 
     if is_broken(body):
         avisos.append(
-            "El archivo viene **desalineado** (parece un CSV mal convertido a Excel). "
-            "Se reconstruyeron las columnas automáticamente, pero **la columna Operación "
-            "(Compra/Venta) no viene en el archivo**, así que “Sentido de la operación” quedará vacío. "
-            "Para tenerla, exporta el reporte directo a Excel o abre el CSV con *Datos → Desde texto/CSV*."
+            "El archivo viene **desalineado** (parece un CSV mal convertido a Excel) y "
+            "**no trae la columna Operación (Compra/Venta)**. Se reconstruyeron las demás columnas. "
+            "Para tener el sentido completo sube el **CSV original** del sistema (sin abrirlo en Excel) "
+            "o un Excel exportado directamente; si no, complétalo abajo."
         )
         parsed, errores = [], []
         for n, r in enumerate(body, start=2):
@@ -231,6 +284,12 @@ def load_source(file):
         for c in ("Medio Instruccion", "Servicio Contratado", "Nombre"):
             df[c] = df[c].map(fix_text)
 
+    for c in ("Precio Ord.", "Precio asignado", "Títulos Ordenados",
+              "Contrato", "Folio Orden", "Vigencia Original"):
+        df[c] = df[c].map(lambda v: (to_number(v) if to_number(v) is not None else v)
+                          if isinstance(v, str) and v.strip() else v)
+    df["Operación"] = df["Operación"].map(norm_sentido)
+    df["__Comentario__"] = ""
     df["Operador"] = df["Operador"].map(lambda v: "" if v is None or pd.isna(v) else str(v).strip())
     df["__Fecha__"] = pd.to_datetime(df["Fecha Registro"].map(parse_date), errors="coerce")
     return df, avisos
@@ -262,6 +321,8 @@ def build_bitacora(df_p: pd.DataFrame, layout_bytes: bytes) -> bytes:
                 val = OP_TO_NAME.get(op, op)
             elif rule == "CONTRATO_PROMOTOR":
                 val = get_promotor(row)
+            elif header == "Comentarios":
+                val = row.get(src_col) or None
             else:
                 val = row.get(src_col) if src_col else rule
 
@@ -282,7 +343,8 @@ def build_bitacora(df_p: pd.DataFrame, layout_bytes: bytes) -> bytes:
 # ─────────────────────────────────────────────────────────────────
 # UI
 # ─────────────────────────────────────────────────────────────────
-src_file = st.file_uploader("Sube el archivo de Bitácoras (.xlsx)", type=["xlsx"])
+src_file = st.file_uploader("Sube el archivo de Bitácoras (.xlsx o el .csv original del sistema)",
+                            type=["xlsx", "csv", "txt"])
 
 if not src_file:
     st.stop()
@@ -321,7 +383,81 @@ if len(meses_archivo) < 3:
     st.caption(f"El archivo solo trae {len(meses_archivo)} mes(es): "
                f"{', '.join(etiqueta_mes(m) for m in meses_archivo)}.")
 
-src = src[src["__Mes__"].isin(meses_sel)]
+src = src[src["__Mes__"].isin(meses_sel)].copy()
+
+# ── Sentido de la operación ───────────────────────────────────
+st.subheader("Sentido de la operación")
+
+sentido_file = st.file_uploader(
+    "Opcional: archivo con el sentido por folio (.xlsx/.csv con columnas "
+    "“Folio Orden” y “Operación” o “Sentido”)",
+    type=["xlsx", "csv", "txt"], key="sentido_file",
+)
+src["__Folio__"] = src["Folio Orden"].map(folio_key)
+n_archivo = int(src["Operación"].notna().sum())
+
+# 1) Complemento por folio
+n_complemento = 0
+if sentido_file:
+    h, b = read_table(sentido_file)
+    comp = pd.DataFrame(b, columns=[str(x) for x in h])
+    cols = {norm_header(c): c for c in comp.columns}
+    c_folio = cols.get("folio orden") or cols.get("folio")
+    c_sent = cols.get("operacion") or cols.get("sentido") or cols.get("sentido de la operacion")
+    if not c_folio or not c_sent:
+        st.error(f"El archivo de sentido debe tener columnas Folio y Operación/Sentido. Trae: {list(comp.columns)}")
+    else:
+        mapa = {folio_key(f): norm_sentido(v) for f, v in zip(comp[c_folio], comp[c_sent]) if norm_sentido(v)}
+        falta = src["Operación"].isna()
+        nuevos = src.loc[falta, "__Folio__"].map(mapa)
+        src.loc[falta, "Operación"] = nuevos
+        n_complemento = int(nuevos.notna().sum())
+
+# 2) Deducción segura por precio (solo donde sigue vacío)
+n_deducido = 0
+for idx in src.index[src["Operación"].isna()]:
+    sentido, nota = deducir_sentido(src.loc[idx])
+    if sentido:
+        src.at[idx, "Operación"] = sentido
+        src.at[idx, "__Comentario__"] = nota
+        n_deducido += 1
+
+# 3) Captura manual de los que no se pueden saber
+pendientes = src[src["Operación"].isna()]
+st.caption(
+    f"Del archivo: {n_archivo} · Del archivo de folios: {n_complemento} · "
+    f"Deducidos por precio (seguros): {n_deducido} · **Pendientes: {len(pendientes)}**"
+)
+if len(pendientes):
+    st.warning(
+        f"{len(pendientes)} operaciones no traen Compra/Venta y no se puede deducir con seguridad "
+        "(se ejecutaron justo al precio límite, fueron a mercado o no se ejecutaron). "
+        "Captúralas en la tabla (puedes pegar una columna desde Excel) o sube el archivo de folios."
+    )
+    editor = pd.DataFrame({
+        "Folio": pendientes["__Folio__"],
+        "Fecha": pendientes["__Fecha__"].dt.date,
+        "Cliente": pendientes["Nombre"],
+        "Emisora": pendientes["Emisora"].astype(str) + " " + pendientes["Serie"].astype(str),
+        "Tipo Orden": pendientes["Tipo Orden"],
+        "Títulos": pendientes["Títulos Ordenados"],
+        "Precio límite": pendientes["Precio Ord."],
+        "Precio asignado": pendientes["Precio asignado"],
+        "Sentido": pd.Series([None] * len(pendientes), index=pendientes.index, dtype="object"),
+    }).sort_values(["Fecha", "Folio"])
+    editado = st.data_editor(
+        editor,
+        hide_index=True,
+        width="stretch",
+        disabled=[c for c in editor.columns if c != "Sentido"],
+        column_config={"Sentido": st.column_config.SelectboxColumn("Sentido", options=SENTIDOS)},
+        key="editor_sentido",
+    )
+    capturados = editado.set_index("Folio")["Sentido"].map(norm_sentido).dropna().to_dict()
+    falta = src["Operación"].isna()
+    src.loc[falta, "Operación"] = src.loc[falta, "__Folio__"].map(capturados)
+
+sin_sentido = int(src["Operación"].isna().sum())
 
 # ── Comprobaciones ────────────────────────────────────────────
 st.subheader("Comprobaciones")
@@ -329,11 +465,14 @@ st.subheader("Comprobaciones")
 total       = len(src)
 sin_asignar = src[src["__Promotor__"] == "SIN ASIGNAR"]
 
-c1, c2, c3 = st.columns(3)
+c1, c2, c3, c4 = st.columns(4)
 c1.metric("Total operaciones", total)
 c2.metric("Asignadas", total - len(sin_asignar))
 c3.metric("Sin asignar", len(sin_asignar),
           delta=f"-{len(sin_asignar)}" if len(sin_asignar) else None,
+          delta_color="inverse")
+c4.metric("Sin sentido", sin_sentido,
+          delta=f"-{sin_sentido}" if sin_sentido else None,
           delta_color="inverse")
 
 dist = (
@@ -357,6 +496,9 @@ if sin_clave:
 
 # ── Descargas ─────────────────────────────────────────────────
 st.subheader("Descargar bitácoras")
+if sin_sentido:
+    st.error(f"Aún hay {sin_sentido} operaciones sin sentido de la operación; "
+             "esas celdas saldrán vacías en las bitácoras.")
 
 # Un Excel por mes y promotor, ordenados por mes
 grupos = sorted(
