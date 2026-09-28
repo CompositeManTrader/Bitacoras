@@ -41,6 +41,7 @@ OP_TO_NAME = {
     "CLCB178007": "ALBERTO ALARCON GONZALEZ",
     "CB331177":   "CB331177",
     "H2H":        "H2H",
+    "INTERNET":   "MIGUEL ANGEL TEBAR PEDROZA",
 }
 
 LAYOUT_MAP = {
@@ -357,39 +358,47 @@ if sin_clave:
 # ── Descargas ─────────────────────────────────────────────────
 st.subheader("Descargar bitácoras")
 
+# Un Excel por mes y promotor, ordenados por mes
 grupos = sorted(
-    (promotor, mes)
+    (mes, promotor)
     for promotor, mes in src[["__Promotor__", "__Mes__"]].drop_duplicates().itertuples(index=False)
     if promotor != "SIN ASIGNAR"
 )
-archivos = []
-for promotor, mes in grupos:
+archivos = []   # (mes, promotor, nombre, n_ops, contenido)
+for mes, promotor in grupos:
     df_p = src[(src["__Promotor__"] == promotor) & (src["__Mes__"] == mes)]
-    archivos.append((f"{promotor} {etiqueta_mes(mes)}.xlsx", len(df_p), build_bitacora(df_p, layout_bytes)))
+    nombre = f"{promotor} {etiqueta_mes(mes)}.xlsx"
+    archivos.append((mes, promotor, nombre, len(df_p), build_bitacora(df_p, layout_bytes)))
 
-# ZIP con todos
+def carpeta_mes(mes: pd.Period) -> str:
+    # "2026-06 Junio 2026" para que las carpetas queden en orden cronológico
+    return f"{mes.year}-{mes.month:02d} {etiqueta_mes(mes)}"
+
+# ZIP con todos: una carpeta por mes con un Excel por promotor
 zip_buf = io.BytesIO()
 with zipfile.ZipFile(zip_buf, "w", zipfile.ZIP_DEFLATED) as zf:
-    for nombre, _, contenido in archivos:
-        zf.writestr(nombre, contenido)
+    for mes, _, nombre, _, contenido in archivos:
+        zf.writestr(f"{carpeta_mes(mes)}/{nombre}", contenido)
 zip_buf.seek(0)
 
 etiqueta_periodo = "_".join(etiqueta_mes(m).replace(" ", "_") for m in sorted(meses_sel))
 st.download_button(
-    label=f"⬇️ Descargar todos en ZIP ({len(archivos)} archivos)",
+    label=f"⬇️ Descargar todos en ZIP ({len(archivos)} archivos, carpeta por mes)",
     data=zip_buf,
     file_name=f"Bitacoras_{etiqueta_periodo}.zip",
     mime="application/zip",
     type="primary",
 )
 
-# Individuales
+# Individuales, agrupados por mes
 st.caption("O descarga por separado:")
-for nombre, n_ops, contenido in archivos:
-    st.download_button(
-        label=f"📄 {nombre[:-5]}  ({n_ops} operaciones)",
-        data=contenido,
-        file_name=nombre,
-        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-        key=nombre,
-    )
+for mes in sorted({a[0] for a in archivos}):
+    st.markdown(f"**{etiqueta_mes(mes)}**")
+    for _, promotor, nombre, n_ops, contenido in (a for a in archivos if a[0] == mes):
+        st.download_button(
+            label=f"📄 {promotor}  ({n_ops} operaciones)",
+            data=contenido,
+            file_name=nombre,
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            key=nombre,
+        )
